@@ -1,0 +1,15 @@
+torch
+torchvision
+transformers
+scikit-learn
+pandas
+numpy
+pillow
+pytest
+requests
+gdown
+tqdm
+datasets
+huggingface_hub
+easyocr
+opencv-python-headless
