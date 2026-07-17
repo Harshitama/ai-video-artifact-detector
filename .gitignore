@@ -5,3 +5,5 @@ data/
 sample_pack.zip
 results.json
 *.pyc
+invoice.html
+*.pdf
