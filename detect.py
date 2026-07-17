@@ -8,18 +8,6 @@ import torch
 from transformers import AutoImageProcessor, Dinov2Model
 import easyocr
 
-def get_scene_key(filename):
-    # Remove prefix "artifact_XX_" or "clean_XX_"
-    name = filename.replace("artifact_", "").replace("clean_", "")
-    # Remove leading digits and underscores
-    while name and (name[0].isdigit() or name[0] == '_'):
-        name = name[1:]
-    # Remove suffix starting with common separators
-    for suffix in ["_f", "_final", "_demo", "_hero", "_payoff", "_hook", "_hero"]:
-        if suffix in name:
-            name = name.split(suffix)[0]
-    return name
-
 def get_dinov2_image_embeds(model, image_inputs):
     outputs = model(**image_inputs)
     return outputs.pooler_output
@@ -40,7 +28,7 @@ def main():
     # 1. Load Model Assets
     model_path = os.path.join(os.path.dirname(__file__), "model_assets", "model.pkl")
     if not os.path.exists(model_path):
-        print(f"Error: Model assets not found at '{model_path}'. Please run train_hybrid.py first.")
+        print(f"Error: Model assets not found at '{model_path}'. Please run train.py first.")
         return
         
     with open(model_path, 'rb') as f:
@@ -48,12 +36,7 @@ def main():
         
     clf = model_data['classifier']
     dino_model_id = model_data['dino_model_id']
-    ref_embeddings_norm = model_data['ref_embeddings_norm']
-    ref_names = model_data['ref_names']
-    ref_labels = model_data['ref_labels']
-    
-    # Pre-calculate reference scene keys
-    ref_scene_keys = [get_scene_key(name) for name in ref_names]
+    fallback_threshold = model_data['fallback_threshold']
     
     # 2. Initialize Models
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -64,8 +47,42 @@ def main():
     print("Loading EasyOCR reader (English + Japanese) on CPU/GPU...")
     reader = easyocr.Reader(['en', 'ja'], gpu=torch.cuda.is_available())
     
-    # 3. Process Images
+    # 3. Process Optional Reference Frames (For Tier 2 Unsupervised Clustering)
     supported_extensions = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
+    ref_dir = os.path.join(os.path.dirname(__file__), "reference_frames")
+    ref_embeddings_norm = None
+    ref_labels = []
+    
+    if os.path.exists(ref_dir):
+        print(f"Found optional 'reference_frames' directory at '{ref_dir}'. Indexing reference frames...")
+        ref_images = []
+        for label_name, label_val in [("clean", 0), ("artifact", 1)]:
+            sub_dir = os.path.join(ref_dir, label_name)
+            if os.path.exists(sub_dir):
+                for f in os.listdir(sub_dir):
+                    if os.path.splitext(f)[1].lower() in supported_extensions:
+                        ref_images.append((os.path.join(sub_dir, f), label_val))
+                        
+        if len(ref_images) > 0:
+            ref_embeddings = []
+            for path, label_val in ref_images:
+                try:
+                    img = Image.open(path).convert('RGB')
+                    inputs = dino_processor(images=img.resize((224, 224)), return_tensors="pt").to(device)
+                    with torch.no_grad():
+                        img_emb = get_dinov2_image_embeds(dino_model, inputs)
+                        ref_embeddings.append(img_emb[0].cpu().numpy())
+                        ref_labels.append(label_val)
+                except Exception as e:
+                    print(f"  Warning: Failed to load reference image '{path}': {e}")
+            if len(ref_embeddings) > 0:
+                X_ref = np.stack(ref_embeddings)
+                ref_embeddings_norm = X_ref / np.linalg.norm(X_ref, axis=1, keepdims=True)
+                print(f"Cached {len(ref_embeddings_norm)} reference frames for Tier 2 Scene Contrast.")
+    else:
+        print("[Info] No local 'reference_frames' directory found. Bypassing Tier 2 Scene Contrast.")
+        
+    # 4. Process Input Folder Images
     image_files = sorted([
         f for f in os.listdir(input_folder) 
         if os.path.splitext(f)[1].lower() in supported_extensions
@@ -93,12 +110,11 @@ def main():
                     is_text_artifact = True
             
             if is_text_artifact:
-                # Map score to >= 0.5 for artifact
                 final_score = float(max(0.5, ocr_score))
                 flag = "artifact"
                 print(f"  -> Text Artifact detected (ocr_score={ocr_score:.4f})")
             else:
-                # Step B: Run DinoV2 Feature Extraction
+                # Extract DinoV2 Feature Embedding
                 img = Image.open(img_path).convert('RGB')
                 inputs = dino_processor(images=img.resize((224, 224)), return_tensors="pt").to(device)
                 with torch.no_grad():
@@ -108,58 +124,54 @@ def main():
                 # L2-normalize
                 emb_norm = emb_numpy / np.linalg.norm(emb_numpy)
                 
-                # Calculate cosine similarities to reference set
-                sims = np.dot(ref_embeddings_norm, emb_norm)
-                nn_idx = np.argmax(sims)
-                nn_sim = sims[nn_idx]
-                
                 final_score = 0.0
                 flag = "clean"
+                nn_sim = 0.0
                 
-                # Scene-specific relative contrastive check (for known scenes)
-                if nn_sim >= 0.65:
-                    target_scene = ref_scene_keys[nn_idx]
-                    # Find all references matching this scene key
-                    scene_indices = [i for i, sk in enumerate(ref_scene_keys) if sk == target_scene]
+                # Step B: Tier 2 Scene Contrast (Unsupervised Visual Clustering)
+                if ref_embeddings_norm is not None:
+                    # Calculate cosine similarities to reference set
+                    sims = np.dot(ref_embeddings_norm, emb_norm)
+                    nn_idx = np.argmax(sims)
+                    nn_sim = sims[nn_idx]
                     
-                    art_similarities = [sims[i] for i in scene_indices if ref_labels[i] == 1]
-                    cln_similarities = [sims[i] for i in scene_indices if ref_labels[i] == 0]
-                    
-                    if len(art_similarities) > 0 and len(cln_similarities) > 0:
-                        max_art_sim = max(art_similarities)
-                        max_cln_sim = max(cln_similarities)
+                    if nn_sim >= 0.75:
+                        # Group all references with similarity >= 0.75 to the test image
+                        scene_indices = [i for i, sim in enumerate(sims) if sim >= 0.75]
                         
-                        # Relative score difference
-                        sim_diff = max_art_sim - max_cln_sim
-                        if sim_diff > 0:
-                            # Closer to the artifact version
-                            flag = "artifact"
-                            # Map positive diff to a score >= 0.5
-                            final_score = float(min(1.0, 0.5 + sim_diff * 2.0))
-                            print(f"  -> Scene-contrast Artifact detected (scene={target_scene}, diff={sim_diff:.4f})")
-                        else:
-                            # Closer to the clean version
-                            flag = "clean"
-                            final_score = float(max(0.0, 0.5 + sim_diff * 2.0))
-                            if final_score >= 0.5:
-                                final_score = 0.49 # Keep consistent
-                            print(f"  -> Scene-contrast Clean detected (scene={target_scene}, diff={sim_diff:.4f})")
-                    else:
-                        # Fallback if the scene doesn't have both types of references
-                        nn_sim = -1.0 # Force fallback
+                        art_similarities = [sims[i] for i in scene_indices if ref_labels[i] == 1]
+                        cln_similarities = [sims[i] for i in scene_indices if ref_labels[i] == 0]
                         
-                # Step C: Fallback Classifier Check (for new/unknown scenes)
-                if nn_sim < 0.65:
+                        if len(art_similarities) > 0 and len(cln_similarities) > 0:
+                            max_art_sim = max(art_similarities)
+                            max_cln_sim = max(cln_similarities)
+                            
+                            sim_diff = max_art_sim - max_cln_sim
+                            if sim_diff > 0:
+                                flag = "artifact"
+                                final_score = float(min(1.0, 0.5 + sim_diff * 2.0))
+                                print(f"  -> Visual-contrast Artifact detected (diff={sim_diff:.4f})")
+                            else:
+                                flag = "clean"
+                                final_score = float(max(0.0, 0.5 + sim_diff * 2.0))
+                                if final_score >= 0.5:
+                                    final_score = 0.49
+                                print(f"  -> Visual-contrast Clean detected (diff={sim_diff:.4f})")
+                            # Set nn_sim to 1.0 to bypass fallback
+                            nn_sim = 1.0
+                            
+                # Step C: Tier 3 Fallback Classifier Check
+                if nn_sim < 0.75:
                     clf_prob = clf.predict_proba([emb_norm])[0, 1]
-                    if clf_prob >= 0.60:
+                    if clf_prob >= fallback_threshold:
                         flag = "artifact"
-                        # Scale [0.60, 1.00] to [0.50, 1.00]
-                        final_score = float(0.5 + (clf_prob - 0.60) * (0.5 / 0.4))
+                        # Scale [fallback_threshold, 1.00] to [0.50, 1.00]
+                        final_score = float(0.5 + (clf_prob - fallback_threshold) * (0.5 / (1.0 - fallback_threshold)))
                         print(f"  -> Classifier Fallback Artifact detected (prob={clf_prob:.4f}, scaled={final_score:.4f})")
                     else:
                         flag = "clean"
-                        # Scale [0.00, 0.60) to [0.00, 0.50)
-                        final_score = float(clf_prob * (0.5 / 0.60))
+                        # Scale [0.00, fallback_threshold) to [0.00, 0.50)
+                        final_score = float(clf_prob * (0.5 / fallback_threshold))
                         print(f"  -> Classifier Fallback Clean detected (prob={clf_prob:.4f}, scaled={final_score:.4f})")
             
             # Ensure strict consistency between score and flag
@@ -176,7 +188,6 @@ def main():
             
         except Exception as e:
             print(f"  Error processing {filename}: {e}")
-            # Safe default fallback on error
             results.append({
                 "path": img_path,
                 "score": 0.5,

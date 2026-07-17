@@ -48,26 +48,31 @@ The classifier in Tier 3 was trained on a custom, category-balanced synthetic da
 
 ## 3. Performance Metrics
 
-Performance evaluated on the client's provided **21-image Sample Pack** (which contains 11 artifact frames and 10 clean frames):
+To ensure zero evaluation-data leakage, the model was evaluated on a completely independent **held-out validation split** (20% of the category-balanced DinoV2 features, representing 117 unseen images). The sample pack was excluded entirely and served as an independent calibration set.
 
 | Metric | Score | Detail |
 |---|---|---|
-| **Recall** | **100.0%** | 11 / 11 artifacts correctly detected |
-| **Precision** | **100.0%** | 11 / 11 predicted artifacts correct |
-| **F1-Score** | **100.0%** | Harmonic mean of precision & recall |
-| **Accuracy** | **100.0%** | 21 / 21 total frames correctly classified |
-
-### Detailed Sample Pack Outputs:
-- **100% of text artifacts** (`artifact_01` to `artifact_08`) and the hybrid hand/text artifact (`artifact_09`) were correctly detected via OCR.
-- **100% of hand artifacts** (`artifact_10` and `artifact_11`) were correctly detected via Relative DinoV2 Scene Contrast.
-- **10 out of 10 clean frames** were correctly classified as clean.
+| **Recall** | **81.03%** | 47 / 58 unseen validation artifacts correctly detected |
+| **Precision** | **67.14%** | 47 / 70 predicted validation artifacts correct |
+| **F1-Score** | **73.44%** | Harmonic mean of precision & recall on validation split |
+| **Accuracy** | **70.94%** | 83 / 117 total validation frames correctly classified |
 
 ---
 
-## 4. Failure Analysis & Limitations
+## 4. Unsupervised DinoV2 Visual Clustering (Tier 2)
+
+In production, video frames will have arbitrary naming conventions. To make the Relative Scene Contrast naming-agnostic, the pipeline dynamically clusters similar frames at runtime:
+1. **Dynamic Registration**: Drop reference frames into a `reference_frames/clean/` and `reference_frames/artifact/` directory.
+2. **Visual Clustering**: During inference, if a test frame has a DinoV2 cosine similarity $\ge 0.75$ to any reference frame, the model dynamically groups all reference frames with similarity $\ge 0.75$ to form a "scene cluster".
+3. **Relative Decision**: It performs the relative contrastive check (`max_art_sim` vs `max_cln_sim`) within this visual cluster.
+4. **Fallback**: If no matching reference cluster is found (similarity < 0.75), it safely falls back to the trained RBF SVM classifier (Tier 3).
+
+---
+
+## 5. Failure Analysis & Limitations
 
 ### Where it Fails (False Positives):
-- **Borderline Abstract/Stylized Holograms**: An early iteration had minor false positives on `clean_06` (glowing blueprint) and `clean_09` (low-contrast Japanese captions) because a default 0.50 threshold was too sensitive to abstract backgrounds. By calibrating the fallback threshold to `0.60`, these were fully resolved. However, extremely stylized or heavily degraded new styles might still generate borderline probabilities in the fallback stage.
+- **Sci-Fi Holographic Styling**: Floating user interfaces, neon layouts, and glowing blueprints (like `clean_06`) look structurally "warped" compared to standard physical objects in the natural image training set, which can bias the fallback classifier towards predicting artifacts. In production, this can be easily calibrated by dropping a few clean holographic frames into the `reference_frames/clean/` folder to activate Tier 2.
 
 ### Limitations:
 1. **Tiny Hand Anomalies**: If a hand contains very tiny local anomalies (like a slightly fused fingernail) but is otherwise structurally normal, a global DinoV2 representation might miss it in a new scene.
@@ -75,7 +80,7 @@ Performance evaluated on the client's provided **21-image Sample Pack** (which c
 
 ---
 
-## 5. Installation & Reproducibility
+## 6. Installation & Reproducibility
 
 ### Setup Environment
 Ensure Python 3.12 is installed, then set up the virtual environment and install dependencies:
