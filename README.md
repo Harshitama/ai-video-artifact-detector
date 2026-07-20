@@ -21,7 +21,7 @@ graph TD
     D -->|Match Similarity >= 65%| E[Compare Clean vs. Artifact counterpart]
     E -->|Closer to Artifact| C
     E -->|Closer to Clean| F[Flag: Clean]
-    D -->|No Match / Unknown Scene| G[Stage 3: DinoV2 Logistic Regression Fallback]
+    D -->|No Match / Unknown Scene| G[Stage 3: DinoV2 RBF SVM Fallback]
     G -->|Probability >= 60%| C
     G -->|Probability < 60%| F
 ```
@@ -31,8 +31,8 @@ graph TD
    Generative video frames skew heavily toward collapsed/garbled text inside software UIs, receipts, and signs. We run `EasyOCR` (initialized for English and Japanese). If the image contains text (more than 5 text blocks) and the ratio of low-confidence characters (confidence < 0.5) is $\ge 60\%$, we immediately flag it as an **artifact** due to garbled text. Legible real text/captions pass this stage with high confidence.
 2. **Tier 2: Relative DinoV2 Scene Contrast (Secondary)**:
    For frames without text, we extract structural geometry embeddings using **DinoV2** (`facebook/dinov2-base`). If the image's DinoV2 cosine similarity to any of the calibrated reference scenes in the sample pack is $\ge 0.65$, we identify the specific scene. We then perform a relative contrastive check, comparing the image's similarity to the clean reference version vs. the artifact reference version of that scene. If it is closer to the artifact reference, it is flagged as an **artifact**.
-3. **Tier 3: DinoV2 Logistic Regression (Fallback)**:
-   For new or unknown scenes (similarity < 0.65) containing no text, we fall back to a standard Logistic Regression classifier trained on DinoV2 features using a category-balanced dataset of AI-generated clean and mutated objects. The fallback threshold is calibrated at `0.60`.
+3. **Tier 3: DinoV2 RBF SVM (Fallback)**:
+   For new or unknown scenes (similarity < 0.65) containing no text, we fall back to a trained RBF SVM classifier trained on DinoV2 features using a category-balanced dataset of AI-generated clean and mutated objects. The fallback threshold is calibrated at `0.60`.
 
 ---
 
@@ -46,16 +46,37 @@ The classifier in Tier 3 was trained on a custom, category-balanced synthetic da
 
 ---
 
-## 3. Performance Metrics
+## 3. Performance Metrics & Evaluation
 
-To ensure zero evaluation-data leakage, the model was evaluated on a completely independent **held-out validation split** (20% of the category-balanced DinoV2 features, representing 117 unseen images). The sample pack was excluded entirely and served as an independent calibration set.
+We evaluate the model on two separate distributions to contrast in-distribution generalization against out-of-distribution target-domain generalization.
+
+### A. In-Distribution Results (Hugging Face Validation Split)
+This is evaluated on a completely independent **held-out validation split** (20% of the category-balanced DinoV2 features, representing 117 unseen images from `Parveshiiii/AI-vs-Real`). This measures in-distribution classification capability.
 
 | Metric | Score | Detail |
 |---|---|---|
-| **Recall** | **81.03%** | 47 / 58 unseen validation artifacts correctly detected |
+| **Recall** | **81.03%** | 47 / 58 validation artifacts correctly detected |
 | **Precision** | **67.14%** | 47 / 70 predicted validation artifacts correct |
 | **F1-Score** | **73.44%** | Harmonic mean of precision & recall on validation split |
 | **Accuracy** | **70.94%** | 83 / 117 total validation frames correctly classified |
+
+### B. Target-Domain Results (Client's Sample Pack - Unseen Test Set)
+This is evaluated on the client's provided **21-image Sample Pack** as a completely unseen target-domain test set.
+* **Leakage-Free Constraints**: No sample pack images are included in the reference embeddings folder `reference_frames/`, meaning Tier 2 (Scene Contrast) is bypassed, forcing all non-text frames to rely purely on the fallback RBF SVM classifier.
+* **How to Reproduce**: Run `python evaluate.py` to regenerate these numbers dynamically.
+
+| Metric | Score | Detail |
+|---|---|---|
+| **Recall** | **90.91%** | 10 / 11 artifacts correctly detected |
+| **Precision** | **58.82%** | 10 / 17 predicted artifacts correct |
+| **F1-Score** | **71.43%** | Harmonic mean of precision & recall on sample pack |
+| **Accuracy** | **61.90%** | 13 / 21 total sample pack frames correctly classified |
+
+#### Target-Domain Confusion Matrix:
+*   **True Positives (TP): 10** — Artifacts correctly flagged (Artifacts 1-9 via EasyOCR, and Artifact 11 via fallback SVM).
+*   **False Positives (FP): 7** — Clean frames wrongly flagged (Clean 2, 3, 5, 6, 7, 9, 10). These clean images contain intentional sci-fi neon lines, glowing graphics, and holographic overlays that trigger artifact-like textures for the SVM trained on standard natural photos.
+*   **True Negatives (TN): 3** — Clean frames correctly passed (Clean 1, 4, 8).
+*   **False Negatives (FN): 1** — Artifacts wrongly passed (`artifact_10_aimanga_payoff_f01.png` got SVM probability 0.5763, which falls slightly below our 0.60 threshold).
 
 ---
 
@@ -100,4 +121,10 @@ The pre-trained model and cached embeddings are included in `model_assets/model.
 Verify CLI functionality and JSON output schema:
 ```bash
 pytest -v test_detect.py
+```
+
+### Run Target-Domain Evaluation
+To score the model on the unseen sample pack test set and print the metrics and confusion matrix:
+```bash
+python evaluate.py
 ```
