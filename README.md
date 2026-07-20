@@ -30,7 +30,7 @@ graph TD
 1. **Tier 1: EasyOCR Text Analyzer (Primary)**:
    Generative video frames skew heavily toward collapsed/garbled text inside software UIs, receipts, and signs. We run `EasyOCR` (initialized for English and Japanese). If the image contains text (more than 5 text blocks) and the ratio of low-confidence characters (confidence < 0.5) is $\ge 60\%$, we immediately flag it as an **artifact** due to garbled text. Legible real text/captions pass this stage with high confidence.
 2. **Tier 2: Relative DinoV2 Scene Contrast (Secondary)**:
-   For frames without text, we extract structural geometry embeddings using **DinoV2** (`facebook/dinov2-base`). If the image's DinoV2 cosine similarity to any of the calibrated reference scenes in the sample pack is $\ge 0.65$, we identify the specific scene. We then perform a relative contrastive check, comparing the image's similarity to the clean reference version vs. the artifact reference version of that scene. If it is closer to the artifact reference, it is flagged as an **artifact**.
+   For frames without text, we extract structural geometry embeddings using **DinoV2** (`facebook/dinov2-base`). If the image's DinoV2 cosine similarity to any optional, user-provided reference images is $\ge 0.75$, the model dynamically clusters similar scenes. It then performs a relative contrastive check, comparing the image's similarity to the clean reference vs. the artifact reference in that cluster. If it is closer to the artifact reference, it is flagged as an **artifact**.
 3. **Tier 3: DinoV2 RBF SVM (Fallback)**:
    For new or unknown scenes (similarity < 0.65) containing no text, we fall back to a trained RBF SVM classifier trained on DinoV2 features using a category-balanced dataset of AI-generated clean and mutated objects. The fallback threshold is calibrated at `0.60`.
 
@@ -88,6 +88,9 @@ In production, video frames will have arbitrary naming conventions. To make the 
 3. **Relative Decision**: It performs the relative contrastive check (`max_art_sim` vs `max_cln_sim`) within this visual cluster.
 4. **Fallback**: If no matching reference cluster is found (similarity < 0.75), it safely falls back to the trained RBF SVM classifier (Tier 3).
 
+> [!NOTE]
+> These local reference frames are completely optional and are not used or required during the baseline evaluation script (`evaluate.py`).
+
 ---
 
 ## 5. Failure Analysis & Limitations
@@ -127,4 +130,27 @@ pytest -v test_detect.py
 To score the model on the unseen sample pack test set and print the metrics and confusion matrix:
 ```bash
 python evaluate.py
+```
+
+#### Expected Output of evaluate.py
+```text
+=== Running Evaluation Script ===
+Executing: D:\Manifestation\venv\Scripts\python.exe detect.py --input data\sample_pack\sample_pack --output results.json
+detect.py execution complete.
+
+================ EVALUATION SUMMARY ================
+Target Domain: Client's Sample Pack (Unseen Test Set)
+Total Evaluated Frames: 21
+----------------------------------------------------
+Accuracy:  61.9048%
+Precision: 58.8235%
+Recall:    90.9091%
+F1-Score:  71.4286%
+----------------------------------------------------
+Confusion Matrix:
+  True Positives (TP):  10  (Artifacts correctly flagged)
+  False Positives (FP): 7  (Clean frames wrongly flagged)
+  True Negatives (TN):  3  (Clean frames correctly passed)
+  False Negatives (FN): 1  (Artifacts wrongly passed)
+====================================================
 ```
