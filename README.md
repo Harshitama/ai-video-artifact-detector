@@ -1,8 +1,8 @@
 # AI-Generated Video Frame Artifact Detector
 
-A per-frame image classifier designed to flag visible AI-generation defects—such as collapsed/garbled text, mutated/melted hands, distorted faces, and physically impossible geometry—in video frames. 
+A per-frame image classifier designed to flag visible AI-generation defects-such as collapsed/garbled text, mutated/melted hands, distorted faces, and physically impossible geometry in video frames. 
 
-Inference runs **completely locally** without any external API calls, conforming to the CLI interface:
+Inference runs completely locally without any external API calls, conforming to the CLI interface:
 ```bash
 python detect.py --input <folder> --output results.json
 ```
